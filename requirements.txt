@@ -1,0 +1,56 @@
+# ============================================================
+# MedRAG — Python Dependencies
+# ============================================================
+
+# --- Core Framework ---
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-core>=0.2.0
+langgraph>=0.1.0
+
+# --- LLM Providers ---
+langchain-groq>=0.1.6
+langchain-ollama>=0.1.0
+
+# --- Embeddings ---
+langchain-huggingface>=0.0.3
+sentence-transformers>=3.0.0
+torch>=2.2.0
+transformers>=4.40.0
+
+# --- Vector DB ---
+qdrant-client>=1.9.0
+langchain-qdrant>=0.1.2
+fastembed>=0.3.0           # Sparse BM25 vectors
+
+# --- PDF Parsing & Ingestion ---
+docling>=1.16.0
+Pillow>=10.3.0
+pypdfium2>=4.0.0
+
+# --- VLM Captioning (Gemini) ---
+google-generativeai>=0.7.0
+
+# --- Reranking ---
+FlagEmbedding>=1.2.10      # bge-reranker-large
+
+# --- UI ---
+chainlit>=1.1.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+aiofiles>=23.2.0
+jinja2>=3.1.4
+websockets>=12.0
+
+# --- Utilities ---
+python-dotenv>=1.0.1
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+tenacity>=8.3.0
+loguru>=0.7.2
+httpx>=0.27.0
+numpy>=1.26.4
+tqdm>=4.66.4
+rich>=13.7.1
+langchain-experimental
