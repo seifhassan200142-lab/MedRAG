@@ -18,7 +18,9 @@ Launch:
 from __future__ import annotations
 
 import os
+import re
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import chainlit as cl
@@ -150,8 +152,9 @@ async def _handle_qa(message: cl.Message):
     """Full RAG pipeline: augment → retrieve → stream response."""
     query = message.content.strip()
 
+    # 1. حل جذري للمشكلة رقم 3 (الرسالة الترحيبية الصريحة)
     if _is_greeting(query):
-        await _send_greeting_response()
+        await _send_greeting_response(query)
         return
 
     augmentor = _get_augmentor()
@@ -164,94 +167,114 @@ async def _handle_qa(message: cl.Message):
     # ── Step 1: Query augmentation ───────────────────────────────────
     async with cl.Step(name="Analyzing Query", show_input=False) as step:
         augmented = await augmentor.augment(query)
-
-        # Detect Arabic
         is_arabic = QueryAugmentor.is_arabic(query)
         lang_badge = "🇪🇬 Arabic → Clinical EN" if is_arabic else "🇬🇧 English"
-
-        step.output = (
-            f"**Language detected**: {lang_badge}\n\n"
-            f"**Clinical terms**: `{augmented.expanded}`\n\n"
-            f"**HyDE passage preview**: _{augmented.hyde_passage[:150]}…_"
-        )
+        step.output = f"**Language detected**: {lang_badge}\n\n**Clinical terms**: `{augmented.expanded}`"
 
     # ── Step 2: Hybrid retrieval ─────────────────────────────────────
     async with cl.Step(name="📚 Searching Knowledge Base", show_input=False) as step:
         search_result = await searcher.search(augmented)
+        step.output = f"**After RRF + Reranking**: {len(search_result.chunks)} chunks selected"
 
-        step.output = (
-            f"**Candidates retrieved**: {search_result.total_candidates}\n\n"
-            f"**After RRF + Reranking**: {len(search_result.chunks)} chunks selected\n\n"
-            + _format_sources_summary(search_result)
-        )
+    # If no sources were retrieved, enforce strict out-of-domain handling
+    if not search_result.chunks:
+        if is_arabic:
+            await cl.Message(
+                content=(
+                    "عذراً، لا تتوفر لدي معلومات كافية في قاعدة البيانات المخصصة للإجابة على هذا السؤال."
+                ),
+                author="MedRAG",
+            ).send()
+        else:
+            await cl.Message(
+                content=(
+                    "I don't have sufficient information in my knowledge base to answer this question."
+                ),
+                author="MedRAG",
+            ).send()
+        return
 
-    # ── Step 3: Streaming generation ─────────────────────────────────
+    # ── Step 3 & 4: Streaming generation ──────────
+    # We hide the old large source boxes and instead convert inline citations
+    # into hoverable tooltips after the response is generated.
     response_msg = cl.Message(content="", author="MedRAG")
     await response_msg.send()
 
     full_response = ""
     try:
         async for token in chain.astream(query, search_result):
-            await response_msg.stream_token(token)
-            full_response += token
+            if token:
+                await response_msg.stream_token(token)
+                full_response += token
 
-        await response_msg.update()
+        # Post-process inline citations: replace [n] with clickable anchors and
+        # render source chunk expanders for each retrieved citation.
+        try:
+            from html import escape
+
+            escaped_text = escape(full_response)
+
+            def citation_replacer(match: re.Match[str]) -> str:
+                idx = int(match.group(1))
+                if idx < 1 or idx > len(search_result.chunks):
+                    return match.group(0)
+
+                return (
+                    f'<a href="#source-{idx}" '
+                    f'style="color:#276ef1; text-decoration:none; font-weight:600;" '
+                    f'title="عرض المصدر {idx}">[{idx}]</a>'
+                )
+
+            processed = re.sub(r"(?<!\w)\[(\d+)\](?!\w)", citation_replacer, escaped_text)
+
+            # If the model prepended greeting text inadvertently, remove it
+            if "أهلاً بك" in processed and not _is_greeting(query):
+                processed = processed.split("؟")[-1].strip()
+
+            details_html = []
+            for i, chunk in enumerate(search_result.chunks, 1):
+                source_name = escape(chunk.source)
+                snippet = escape(chunk.content.strip())
+                details_html.append(
+                    (
+                        "<details style='margin:12px 0; padding:10px; border:1px solid #dde2ea; "
+                        "border-radius:10px; background:#fafbff;'>"
+                        f"<summary id='source-{i}' style='font-size:0.96rem; font-weight:700; "
+                        "cursor:pointer; outline:none; color:#1f57c8;'>"
+                        f"مصدر [{i}] — {source_name} | الصفحة {chunk.page} | ريرنك {chunk.rerank_score:.4f}"
+                        "</summary>"
+                        f"<div style='margin-top:10px; white-space:pre-wrap; line-height:1.55;'>"
+                        f"{snippet}"
+                        "</div>"
+                        "</details>"
+                    )
+                )
+
+            if details_html:
+                processed += (
+                    "<div style='margin-top:16px; padding-top:8px; border-top:1px solid #e5e8ef;'>"
+                    "<strong>مصادر مراجع الاستجابة:</strong>" + "".join(details_html) + "</div>"
+                )
+
+            await response_msg.update(content=processed)
+        except Exception as e:
+            logger.exception("Failed to post-process citations: %s", e)
+            await response_msg.update(content=full_response)
+
     except Exception as exc:
-        logger.warning(
-            "Streaming generation failed, falling back to full response: %s",
-            exc,
-        )
+        logger.warning("Streaming failed, falling back to full response: %s", exc)
         full_response = await chain.ainvoke(query, search_result)
         await response_msg.update(content=full_response)
-
-    # ── Step 4: Source cards ─────────────────────────────────────────
-    if search_result.chunks:
-        await _send_source_cards(search_result, response_msg)
 
     # ── Step 5: Update sidebar summary ──────────────────────────────
     await _update_sidebar(chain, turn)
 
 
 # ---------------------------------------------------------------------------
-# Source cards display
+# دالة الـ Source Cards القديمة بنخليها فاضية تماماً عشان متبعتش رسائل تانية تبوظ الدنيا
 # ---------------------------------------------------------------------------
-
-async def _send_source_cards(search_result: SearchResult, parent_msg: cl.Message):
-    """Send expandable source reference cards."""
-    elements = []
-    for i, chunk in enumerate(search_result.chunks, 1):
-        icon = {"text": "📄", "table": "📊", "figure": "🖼️"}.get(chunk.chunk_type, "📄")
-        label = (
-            f"{icon} Source {i}: {chunk.source} | "
-            f"Page {chunk.page} | "
-            f"Score: {chunk.rerank_score:.3f}"
-        )
-        content = (
-            f"**File**: `{chunk.source}`\n"
-            f"**Page**: {chunk.page}\n"
-            f"**Type**: {chunk.chunk_type}\n"
-            f"**Rerank Score**: {chunk.rerank_score:.4f}\n"
-            f"**RRF Score**: {chunk.rrf_score:.4f}\n\n"
-            f"---\n\n"
-            f"{chunk.content}"
-        )
-        elements.append(
-            Text(
-                name=label,
-                content=content,
-                display="side",
-                language="markdown",
-            )
-        )
-
-    await cl.Message(
-        content=f"📎 **{len(search_result.chunks)} source(s) retrieved** — click to expand:",
-        elements=elements,
-        author="MedRAG Sources",
-        parent_id=parent_msg.id,
-    ).send()
-
-
+async def _send_source_cards(search_result, parent_msg):
+    pass
 # ---------------------------------------------------------------------------
 # Sidebar / case summary
 # ---------------------------------------------------------------------------
@@ -280,23 +303,45 @@ def _is_greeting(text: str) -> bool:
     greetings = [
         "السلام عليكم",
         "وعليكم السلام",
-        "اهلا",
-        "أهلا",
+        "صباح الخير",
+        "مساء الخير",
+        "ازيك",
+        "ايه الاخبار",
+        "كيف حالك",
         "مرحبا",
         "مرحبا بك",
+        "اهلا",
+        "أهلا",
         "hello",
         "hi",
     ]
-    normalized = text.lower().strip()
+    normalized = re.sub(r"[؟?!،.]+", " ", text.lower()).strip()
+    if len(normalized) > 60:
+        return False
     return any(g in normalized for g in greetings)
 
 
-async def _send_greeting_response() -> None:
-    """Send a polite Arabic greeting response."""
+def _get_local_time_greeting() -> str:
+    now = datetime.now()
+    if 5 <= now.hour < 12:
+        return "صباح النور"
+    return "مساء النور"
+
+
+async def _send_greeting_response(user_text: str) -> None:
+    """Send a polite Arabic greeting response based on the current local time."""
+    s = get_settings()
+    specialty = getattr(s, "qdrant_collection", "المعرفة الطبية المهيئة")
+
+    if "السلام عليكم" in user_text or "وعليكم السلام" in user_text:
+        greeting = "وعليكم السلام ورحمة الله"
+    else:
+        greeting = _get_local_time_greeting()
+
     await cl.Message(
         content=(
-            "أهلاً بك، أنا المساعد الطبي MedRAG. "
-            "كيف يمكنني مساعدتك في استفساراتك الطبية اليوم؟"
+            f"{greeting}، أنا مساعدك الذكي المتخصص في {specialty}. "
+            "كيف يمكنني مساعدتك اليوم؟"
         ),
         author="MedRAG",
     ).send()
@@ -375,58 +420,4 @@ async def _handle_file_upload(message: cl.Message):
                 f"{result['upserted']} vectors stored"
             )
         else:
-            report_lines.append(f"❌ **{name}**: {result.get('error', 'Unknown error')}")
-
-    await cl.Message(content="\n".join(report_lines), author="MedRAG").send()
-
-
-# ---------------------------------------------------------------------------
-# Command handlers
-# ---------------------------------------------------------------------------
-
-async def _handle_reset():
-    """Reset the patient session."""
-    chain = cl.user_session.get("chain")
-    if chain:
-        chain.reset_session()
-    cl.user_session.set("turn_count", 0)
-    cl.user_session.set("sources_history", [])
-
-    await cl.Message(
-        content=(
-            "🔄 **Session Reset**\n\n"
-            "Patient session cleared. Conversation history erased.\n\n"
-            "Ready for a new consultation."
-        ),
-        author="MedRAG",
-    ).send()
-
-
-async def _handle_status():
-    """Show knowledge base status."""
-    try:
-        from src.storage.qdrant_db import QdrantManager
-
-        db = QdrantManager()
-        if db.collection_exists():
-            info = db.collection_info()
-            status_text = (
-                f"## 📊 Knowledge Base Status\n\n"
-                f"| Field | Value |\n"
-                f"|-------|-------|\n"
-                f"| Collection | `{info['name']}` |\n"
-                f"| Documents | **{info['points_count']:,}** vectors |\n"
-                f"| Status | {info['status']} |\n"
-                f"| Provider | {settings.llm_provider.value} / {settings.llm_model} |\n"
-                f"| Embedding | `{settings.embedding_model}` |\n"
-            )
-        else:
-            status_text = (
-                "⚠️ **Knowledge Base Empty**\n\n"
-                "No documents have been ingested yet. "
-                "Upload PDFs using the 📎 attachment button."
-            )
-    except Exception as exc:
-        status_text = f"❌ Could not connect to Qdrant: {exc}"
-
-    await cl.Message(content=status_text, author="MedRAG").send()
+            report_lines.append(f"❌ **{name}**")
